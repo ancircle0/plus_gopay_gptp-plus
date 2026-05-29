@@ -10,6 +10,7 @@ const store = require('./mysql-store');
 const { listRecentEmailsForAdmin } = require('./pool-email-imap');
 const runtimeLog = require('./runtime-log');
 const { initializeImapAuth, getImapAuthHeaders } = require('./imap-auth');
+const { buildAxiosTransportConfig, prepareProxy } = require('./proxy-utils');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -206,11 +207,14 @@ async function syncAccessDeactivatedProductStatuses(force = false) {
         if (previousSinceTs) {
             params.since = String(previousSinceTs);
         }
+        const systemProxy = String(await store.getAppConfigValue('system_proxy', '')).trim();
+        const transportConfig = buildAxiosTransportConfig(systemProxy);
 
         try {
             const response = await axios.get(ACCESS_DEACTIVATED_MESSAGES_URL, {
                 headers: await getImapAuthHeaders(),
                 params,
+                ...transportConfig,
                 timeout: 30000
             });
 
@@ -251,6 +255,7 @@ async function syncAccessDeactivatedProductStatuses(force = false) {
                     const retryResponse = await axios.get(ACCESS_DEACTIVATED_MESSAGES_URL, {
                         headers: await getImapAuthHeaders(true),
                         params,
+                        ...transportConfig,
                         timeout: 30000
                     });
 
@@ -1516,7 +1521,6 @@ app.post('/api/admin/products/generate-stop', authenticateAdmin, async (req, res
  *  支持 http(s) / socks5 / socks (走 proxy-agent 自动识别协议)。 */
 app.post('/api/admin/proxy/test', authenticateAdmin, async (req, res) => {
     try {
-        const { ProxyAgent } = require('proxy-agent');
         const proxies = Array.isArray(req.body?.proxies) ? req.body.proxies : [];
         const cleaned = proxies.map((p) => String(p || '').trim()).filter(Boolean);
         if (!cleaned.length) {
@@ -1537,35 +1541,46 @@ app.post('/api/admin/proxy/test', authenticateAdmin, async (req, res) => {
             return raw.replace(/\{session\}/gi, sid);
         };
 
+        const systemProxy = String(req.body?.systemProxy || await store.getAppConfigValue('system_proxy', '') || '').trim();
         const testOne = async (raw) => {
             const proxyUrl = subst(raw);
             const t0 = Date.now();
-            let agent;
+            let proxySetup = null;
+            let transportConfig = {};
             try {
-                agent = new ProxyAgent({ getProxyForUrl: () => proxyUrl });
+                proxySetup = await prepareProxy({
+                    systemProxy,
+                    taskProxy: proxyUrl,
+                    label: '代理测试'
+                });
+                transportConfig = buildAxiosTransportConfig(proxySetup.proxyUrl);
             } catch (e) {
                 return { ok: false, error: `代理 URL 解析失败: ${e.message}`, latencyMs: Date.now() - t0 };
             }
             let lastErr = '';
-            for (const probeUrl of PROBE_URLS) {
-                try {
-                    const r = await axios.get(probeUrl, {
-                        httpsAgent: agent,
-                        httpAgent: agent,
-                        proxy: false,
-                        timeout: 12000,
-                        validateStatus: () => true
-                    });
-                    if (r.status === 200) {
-                        const ip = String(r.data || '').trim().split(/\s+/)[0];
-                        return { ok: true, ip, latencyMs: Date.now() - t0, probedVia: probeUrl };
+            try {
+                for (const probeUrl of PROBE_URLS) {
+                    try {
+                        const r = await axios.get(probeUrl, {
+                            ...transportConfig,
+                            timeout: 12000,
+                            validateStatus: () => true
+                        });
+                        if (r.status === 200) {
+                            const ip = String(r.data || '').trim().split(/\s+/)[0];
+                            return { ok: true, ip, latencyMs: Date.now() - t0, probedVia: probeUrl, firstHop: Boolean(systemProxy) };
+                        }
+                        lastErr = `HTTP ${r.status} via ${probeUrl}`;
+                    } catch (e) {
+                        lastErr = `${e.code || ''} ${e.message}`.trim();
                     }
-                    lastErr = `HTTP ${r.status} via ${probeUrl}`;
-                } catch (e) {
-                    lastErr = `${e.code || ''} ${e.message}`.trim();
+                }
+                return { ok: false, error: lastErr || '未知错误', latencyMs: Date.now() - t0, firstHop: Boolean(systemProxy) };
+            } finally {
+                if (proxySetup) {
+                    await proxySetup.close().catch(() => { });
                 }
             }
-            return { ok: false, error: lastErr || '未知错误', latencyMs: Date.now() - t0 };
         };
 
         const results = await Promise.all(cleaned.map((p) => testOne(p)));
@@ -1691,7 +1706,9 @@ app.get('/api/admin/session', (req, res) => {
 app.get('/api/admin/data', async (req, res) => {
     try {
         await ensureStoreReady();
-        await syncAccessDeactivatedProductStatuses();
+        await syncAccessDeactivatedProductStatuses().catch((error) => {
+            console.warn(`[AccessDeactivated] admin data sync skipped: ${error.message}`);
+        });
         const data = await store.getAdminData();
         const system = await getSystemMetrics();
         data.runtime = {
@@ -1843,7 +1860,9 @@ app.delete('/api/admin/cdks/:cdk', async (req, res) => {
 app.get('/api/admin/products', async (req, res) => {
     try {
         await ensureStoreReady();
-        await syncAccessDeactivatedProductStatuses();
+        await syncAccessDeactivatedProductStatuses().catch((error) => {
+            console.warn(`[AccessDeactivated] product list sync skipped: ${error.message}`);
+        });
         res.json(await store.listProducts());
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
@@ -2430,6 +2449,7 @@ app.post('/api/run-process', async (req, res) => {
                     const runtimeEnv = {
                         ...process.env,
                         CHATGPT_TOKEN: token,
+                        SYSTEM_PROXY: String(await store.getAppConfigValue('system_proxy', '')).trim(),
                         SMS_API_KEY: assets.phone.key,
                         BILLING_PHONE: assets.phone.phone,
                         PROXY: assets.proxy,
@@ -2890,7 +2910,7 @@ if (process.env.IS_PRODUCT_FLOW === 'true') {
             console.error('1. 确认本机或远程 MySQL 已启动，并且监听了对应 host/port。');
             console.error(`2. 如果不是本机默认库，请先设置环境变量后再启动，例如:`);
             console.error(
-                `   $env:DB_HOST='127.0.0.1'; $env:DB_PORT='3306'; $env:DB_USER='root'; $env:DB_PASSWORD='你的密码'; $env:DB_NAME='gpt'; node server.js`
+                `   $env:DB_HOST='127.0.0.1'; $env:DB_PORT='3306'; $env:DB_USER='root'; $env:DB_PASSWORD='你的密码'; $env:DB_NAME='plus_papay'; node server.js`
             );
             console.error('3. 首次建库时，请先在 MySQL 中创建数据库，再启动服务自动建表。');
         }

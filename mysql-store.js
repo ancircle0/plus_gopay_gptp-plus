@@ -5,7 +5,7 @@ const mysql = require('mysql2/promise');
 
 const DB_HOST = process.env.DB_HOST || '127.0.0.1';
 const DB_PORT = Number(process.env.DB_PORT || 3306);
-const DB_NAME = process.env.DB_NAME || 'gpt';
+const DB_NAME = process.env.DB_NAME || 'plus_papay';
 const DB_USER = process.env.DB_USER || 'root';
 const DB_PASSWORD = process.env.DB_PASSWORD || '';
 
@@ -13,6 +13,10 @@ const SCHEMA_PATH = path.join(__dirname, 'mysql-schema.sql');
 const DEFAULT_ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || 'admin');
 
 let pool = null;
+
+function quoteIdentifier(identifier) {
+    return `\`${String(identifier).replace(/`/g, '``')}\``;
+}
 
 function getPool() {
     if (!pool) {
@@ -70,6 +74,51 @@ async function runExecute(sql, params = [], options = {}) {
     }
 }
 
+async function ensureDatabaseExists() {
+    let connection;
+    try {
+        connection = await mysql.createConnection({
+            host: DB_HOST,
+            port: DB_PORT,
+            user: DB_USER,
+            password: DB_PASSWORD,
+            database: DB_NAME,
+            charset: 'utf8mb4'
+        });
+        return;
+    } catch (error) {
+        if (!error || error.code !== 'ER_BAD_DB_ERROR') {
+            const detail = error && error.message ? error.message : String(error);
+            throw new Error(`MySQL 数据库初始化失败: ${detail}`);
+        }
+
+        if (connection) {
+            await connection.end();
+            connection = null;
+        }
+
+        try {
+            connection = await mysql.createConnection({
+                host: DB_HOST,
+                port: DB_PORT,
+                user: DB_USER,
+                password: DB_PASSWORD,
+                charset: 'utf8mb4'
+            });
+            await connection.query(
+                `CREATE DATABASE ${quoteIdentifier(DB_NAME)} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
+            );
+        } catch (createError) {
+            const detail = createError && createError.message ? createError.message : String(createError);
+            throw new Error(`MySQL 数据库初始化失败: ${detail}`);
+        }
+    } finally {
+        if (connection) {
+            await connection.end();
+        }
+    }
+}
+
 async function withTransaction(callback) {
     const connection = await getPool().getConnection();
     try {
@@ -112,12 +161,21 @@ function normalizeCdks(cdks) {
     return [...new Set((cdks || []).filter(Boolean).map((item) => String(item).trim()))];
 }
 
+function normalizeInboxProvider(provider) {
+    const value = String(provider || '').trim().toLowerCase();
+    if (['freemail', 'idinging/freemail', 'idinging_freemail'].includes(value)) {
+        return 'freemail';
+    }
+    return 'cloudflare_temp_email';
+}
+
 async function initializeBaseData() {
     await runExecute(
         `INSERT INTO app_config (config_key, config_value)
-         VALUES (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?)
+         VALUES (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?)
          ON DUPLICATE KEY UPDATE config_value = app_config.config_value;`,
         [
+            'system_proxy', '',
             'proxy', '',
             'admin_password_hash', createPasswordHash(DEFAULT_ADMIN_PASSWORD),
             'admin_password_version', '1',
@@ -131,6 +189,8 @@ async function initializeBaseData() {
             'random_email_domain', 'chiyiyi.cloud',
             'email_source', 'random',
             'inbox_api_base', 'https://temp-email-api.jzqkwl.com',
+            'inbox_provider', 'cloudflare_temp_email',
+            'inbox_token', '',
             'inbox_email_domain', '',
             'inbox_email_domains', ''
         ]
@@ -220,6 +280,7 @@ async function ensureLegacyColumns() {
 }
 
 async function ensureReady() {
+    await ensureDatabaseExists();
     const schemaSql = fs.readFileSync(SCHEMA_PATH, 'utf8');
     await runQuery(schemaSql);
     await ensureLegacyColumns();
@@ -325,8 +386,9 @@ async function getAdminData() {
         runQuery(
             `SELECT config_key, config_value
              FROM app_config
-             WHERE config_key IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             WHERE config_key IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
+                'system_proxy',
                 'proxy',
                 'max_concurrent_activations',
                 'max_background_concurrent',
@@ -338,6 +400,8 @@ async function getAdminData() {
                 'random_email_domain',
                 'email_source',
                 'inbox_api_base',
+                'inbox_provider',
+                'inbox_token',
                 'inbox_email_domain',
                 'inbox_email_domains'
             ]
@@ -394,6 +458,7 @@ async function getAdminData() {
 
     return {
         config: {
+            system_proxy: configMap.system_proxy || '',
             proxy: configMap.proxy || '',
             max_concurrent_activations: Math.max(1, Number(configMap.max_concurrent_activations || 1)),
             max_background_concurrent: Math.max(1, Number(configMap.max_background_concurrent || 1)),
@@ -407,6 +472,8 @@ async function getAdminData() {
             pool_email_include_junk: String(configMap.pool_email_include_junk || '1') === '1',
             random_email_domain: String(configMap.random_email_domain || 'chiyiyi.cloud').trim().replace(/^@/, '') || 'chiyiyi.cloud',
             inbox_api_base: String(configMap.inbox_api_base || 'https://temp-email-api.jzqkwl.com').trim().replace(/\/+$/, '') || 'https://temp-email-api.jzqkwl.com',
+            inbox_provider: normalizeInboxProvider(configMap.inbox_provider),
+            inbox_token: String(configMap.inbox_token || ''),
             inbox_email_domain: String(configMap.inbox_email_domain || '').trim().replace(/^@/, ''),
             inbox_email_domains: String(configMap.inbox_email_domains || '').split(/[\n,;\s]+/).map((d) => d.trim().replace(/^@/, '')).filter(Boolean),
             phone_pool: phoneRows.map((row) => ({
@@ -465,31 +532,71 @@ async function getAdminData() {
 }
 
 async function saveConfig(config) {
-    const proxy = String(config?.proxy || '');
-    const maxConcurrentActivations = Math.max(1, Number(config?.max_concurrent_activations || 1));
-    const maxBackgroundConcurrent = Math.max(1, Number(config?.max_background_concurrent || 1));
-    const maintenanceMode = config?.maintenance_mode ? '1' : '0';
-    const maintenanceModeDrain = config?.maintenance_mode_drain ? '1' : '0';
-    const emailSource = ['random', 'pool', 'inbox'].includes(String(config?.email_source))
-        ? String(config.email_source)
-        : (config?.pool_email_enabled ? 'pool' : 'random');
+    const provided = config || {};
+    const scalarKeys = [
+        'system_proxy',
+        'proxy',
+        'max_concurrent_activations',
+        'max_background_concurrent',
+        'maintenance_mode',
+        'maintenance_mode_drain',
+        'pool_email_enabled',
+        'pool_email_imap_host',
+        'pool_email_include_junk',
+        'random_email_domain',
+        'email_source',
+        'inbox_api_base',
+        'inbox_provider',
+        'inbox_token',
+        'inbox_email_domain',
+        'inbox_email_domains'
+    ];
+    const scalarRows = await runQuery(
+        `SELECT config_key, config_value
+         FROM app_config
+         WHERE config_key IN (${scalarKeys.map(() => '?').join(', ')})`,
+        scalarKeys
+    );
+    const existing = Object.fromEntries(scalarRows.map((row) => [row.config_key, row.config_value]));
+    const hasProvided = (key) => Object.prototype.hasOwnProperty.call(provided, key);
+    const readConfig = (key, fallback = '') => hasProvided(key) ? provided[key] : (existing[key] ?? fallback);
+    const readBool = (key, fallback = false) => {
+        const value = readConfig(key, fallback ? '1' : '0');
+        if (typeof value === 'boolean') {
+            return value;
+        }
+        return String(value || '').trim() === '1' || String(value || '').trim().toLowerCase() === 'true';
+    };
+
+    const systemProxy = String(readConfig('system_proxy', ''));
+    const proxy = String(readConfig('proxy', ''));
+    const maxConcurrentActivations = Math.max(1, Number(readConfig('max_concurrent_activations', 1) || 1));
+    const maxBackgroundConcurrent = Math.max(1, Number(readConfig('max_background_concurrent', 1) || 1));
+    const maintenanceMode = readBool('maintenance_mode') ? '1' : '0';
+    const maintenanceModeDrain = readBool('maintenance_mode_drain') ? '1' : '0';
+    const emailSourceRaw = String(readConfig('email_source', ''));
+    const emailSource = ['random', 'pool', 'inbox'].includes(emailSourceRaw)
+        ? emailSourceRaw
+        : (readBool('pool_email_enabled') ? 'pool' : 'random');
     // 兼容旧字段：email_source 是真相，pool_email_enabled 由它派生
     const poolEmailEnabled = emailSource === 'pool' ? '1' : '0';
-    const poolEmailImapHost = String(config?.pool_email_imap_host || 'outlook.office365.com').trim() || 'outlook.office365.com';
-    const poolEmailIncludeJunk = config?.pool_email_include_junk === false || String(config?.pool_email_include_junk || '1') === '0'
+    const poolEmailImapHost = String(readConfig('pool_email_imap_host', 'outlook.office365.com')).trim() || 'outlook.office365.com';
+    const poolEmailIncludeJunk = readConfig('pool_email_include_junk', '1') === false || String(readConfig('pool_email_include_junk', '1')) === '0'
         ? '0'
         : '1';
-    const randomEmailDomain = String(config?.random_email_domain || 'chiyiyi.cloud')
+    const randomEmailDomain = String(readConfig('random_email_domain', 'chiyiyi.cloud') || 'chiyiyi.cloud')
         .trim()
         .replace(/^@/, '')
         .toLowerCase()
         || 'chiyiyi.cloud';
-    const inboxApiBase = String(config?.inbox_api_base || 'https://temp-email-api.jzqkwl.com')
+    const inboxApiBase = String(readConfig('inbox_api_base', 'https://temp-email-api.jzqkwl.com') || 'https://temp-email-api.jzqkwl.com')
         .trim().replace(/\/+$/, '') || 'https://temp-email-api.jzqkwl.com';
-    const inboxEmailDomain = String(config?.inbox_email_domain || '').trim().replace(/^@/, '').toLowerCase();
+    const inboxProvider = normalizeInboxProvider(readConfig('inbox_provider', ''));
+    const inboxToken = String(readConfig('inbox_token', '') || '').trim();
+    const inboxEmailDomain = String(readConfig('inbox_email_domain', '') || '').trim().replace(/^@/, '').toLowerCase();
     // 多域名（一行一个 / 逗号 / 空格分隔）
     const inboxEmailDomainsList = (() => {
-        const raw = config?.inbox_email_domains;
+        const raw = readConfig('inbox_email_domains', '');
         if (Array.isArray(raw)) {
             return raw.map((d) => String(d || '').trim().replace(/^@/, '').toLowerCase()).filter(Boolean);
         }
@@ -499,15 +606,18 @@ async function saveConfig(config) {
             .filter(Boolean);
     })();
     const inboxEmailDomainsRaw = inboxEmailDomainsList.join('\n');
-    const phonePool = normalizePhonePool(Array.isArray(config?.phone_pool) ? config.phone_pool : []);
-    const cardPool = normalizeCardPool(Array.isArray(config?.card_pool) ? config.card_pool : []);
+    const hasPhonePool = Object.prototype.hasOwnProperty.call(config || {}, 'phone_pool');
+    const hasCardPool = Object.prototype.hasOwnProperty.call(config || {}, 'card_pool');
+    const phonePool = normalizePhonePool(hasPhonePool && Array.isArray(config?.phone_pool) ? config.phone_pool : []);
+    const cardPool = normalizeCardPool(hasCardPool && Array.isArray(config?.card_pool) ? config.card_pool : []);
 
     await withTransaction(async (connection) => {
         await runExecute(
             `INSERT INTO app_config (config_key, config_value)
-             VALUES (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?)
+             VALUES (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?)
              ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)`,
             [
+                'system_proxy', systemProxy,
                 'proxy', proxy,
                 'max_concurrent_activations', String(maxConcurrentActivations),
                 'max_background_concurrent', String(maxBackgroundConcurrent),
@@ -519,13 +629,15 @@ async function saveConfig(config) {
                 'random_email_domain', randomEmailDomain,
                 'email_source', emailSource,
                 'inbox_api_base', inboxApiBase,
+                'inbox_provider', inboxProvider,
+                'inbox_token', inboxToken,
                 'inbox_email_domain', inboxEmailDomain,
                 'inbox_email_domains', inboxEmailDomainsRaw
             ],
             { connection }
         );
 
-        if (phonePool.length > 0) {
+        if (hasPhonePool && phonePool.length > 0) {
             const phones = phonePool.map((item) => item[0]);
             const phonePlaceholders = phones.map(() => '?').join(', ');
             await runExecute(
@@ -542,11 +654,11 @@ async function saveConfig(config) {
                     is_active = VALUES(is_active)`,
                 [phonePool]
             );
-        } else {
+        } else if (hasPhonePool) {
             await runExecute(`DELETE FROM phone_assets`, [], { connection });
         }
 
-        if (cardPool.length > 0) {
+        if (hasCardPool && cardPool.length > 0) {
             const cardNumbers = cardPool.map((item) => item[0]);
             const cardPlaceholders = cardNumbers.map(() => '?').join(', ');
             await runExecute(
@@ -575,7 +687,7 @@ async function saveConfig(config) {
                     );
                 }
             }
-        } else {
+        } else if (hasCardPool) {
             await runExecute(`DELETE FROM card_assets`, [], { connection });
         }
     });

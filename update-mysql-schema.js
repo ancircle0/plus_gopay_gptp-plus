@@ -2,7 +2,7 @@ const mysql = require('mysql2/promise');
 
 const DB_HOST = process.env.DB_HOST || '127.0.0.1';
 const DB_PORT = Number(process.env.DB_PORT || 3306);
-const DB_NAME = process.env.DB_NAME || 'gpt';
+const DB_NAME = process.env.DB_NAME || 'plus_papay';
 const DB_USER = process.env.DB_USER || 'root';
 const DB_PASSWORD = process.env.DB_PASSWORD || '';
 

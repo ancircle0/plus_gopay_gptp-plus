@@ -3,6 +3,7 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const ChatGPTService = require('./chatgpt');
 const fs = require('fs');
 const path = require('path');
+const { buildPlaywrightProxy, prepareProxy } = require('./proxy-utils');
 chromium.use(StealthPlugin());
 // 启用 Stealth 插件（在任何 launch 之前调用）
 
@@ -51,30 +52,9 @@ const CONFIG = {
         smsKey: process.env.SMS_API_KEY || "",
         smsPhone: process.env.BILLING_PHONE || ""
     },
-    proxy: process.env.PROXY || ""
+    proxy: process.env.PROXY || "",
+    systemProxy: process.env.SYSTEM_PROXY || ""
 };
-
-function buildPlaywrightProxy(proxyValue) {
-    if (!proxyValue) return null;
-
-    try {
-        const parsed = new URL(proxyValue);
-        const server = `${parsed.protocol}//${parsed.hostname}${parsed.port ? `:${parsed.port}` : ''}`;
-        const proxy = { server };
-
-        if (parsed.username) {
-            proxy.username = decodeURIComponent(parsed.username);
-        }
-        if (parsed.password) {
-            proxy.password = decodeURIComponent(parsed.password);
-        }
-
-        return proxy;
-    } catch (error) {
-        console.warn(`[!] [系统] 代理 URL 解析失败，将按原始值使用: ${error.message}`);
-        return { server: proxyValue };
-    }
-}
 
 function buildDebugScreenshotPath(prefix) {
     const screenshotDir = path.join(__dirname, 'debug_screenshots', '激活');
@@ -167,13 +147,18 @@ async function run() {
     if (DEBUG_HEADFUL) {
         console.log(`🧪 [Step 0] 启动 Stealth 浏览器环境... (HEADFUL=1，有头模式${CHROMIUM_CHANNEL ? `, channel=${CHROMIUM_CHANNEL}` : ''})`);
     }
-    const proxyConfig = buildPlaywrightProxy(CONFIG.proxy);
+    const proxySetup = await prepareProxy({
+        systemProxy: CONFIG.systemProxy,
+        taskProxy: CONFIG.proxy,
+        label: '激活代理'
+    });
+    const proxyConfig = proxySetup.playwrightProxy || buildPlaywrightProxy(proxySetup.proxyUrl);
 
     if (proxyConfig) {
         launchOptions.proxy = proxyConfig;
         // 代理详情不再打印（避免泄露凭证 + 减少噪音）
         const _proxyHost = (() => {
-            try { return new URL(CONFIG.proxy).host; } catch (_) { return '已配置'; }
+            try { return new URL(proxySetup.proxyUrl).host; } catch (_) { return '已配置'; }
         })();
         console.log(`🌐 [系统] 代理已配置`);
     }
@@ -1858,6 +1843,7 @@ async function run() {
         if (stopInactivityWatcher) stopInactivityWatcher();
         console.log("👋 [系统] 流程结束，正在关闭浏览器...");
         await browser.close().catch(() => { });
+        await proxySetup.close().catch(() => { });
     }
 }
 

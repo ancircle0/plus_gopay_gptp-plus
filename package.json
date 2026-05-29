@@ -5,8 +5,10 @@
   "license": "MIT",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "start:headful": "cross-env HEADFUL=1 node server.js"
+    "start": "node --env-file=.env server.js",
+    "start:headful": "cross-env HEADFUL=1 node --env-file=.env server.js",
+    "db:update": "node --env-file=.env update-mysql-schema.js",
+    "db:reset": "node --env-file=.env reset-db.js"
   },
   "engines": {
     "node": ">=20"
@@ -29,6 +31,7 @@
     "puppeteer-core": "^24.42.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "socks": "^2.8.8",
     "uuid": "^14.0.0",
     "ws": "^8.20.0"
   }

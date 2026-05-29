@@ -5,10 +5,10 @@ yarn-debug.log*
 yarn-error.log*
 
 # Local env / secrets
-.env
+#.env
 .env.*
 !.env.example
-*.env
+#*.env
 
 # Runtime artefacts
 _server.out.log

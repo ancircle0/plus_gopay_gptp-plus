@@ -5,6 +5,7 @@ const axios = require('axios');
 const store = require('./mysql-store');
 const runtimeLog = require('./runtime-log');
 const { getImapAuthHeaders, forceRefreshImapToken } = require('./imap-auth');
+const { buildAxiosTransportConfig } = require('./proxy-utils');
 
 const CONFIG = {
     MAX_ACCOUNT_RETRIES: 15,
@@ -119,6 +120,8 @@ async function generateImapKey(email) {
     }
 
     let response;
+    const systemProxy = String(await store.getAppConfigValue('system_proxy', '')).trim();
+    const transportConfig = buildAxiosTransportConfig(systemProxy);
     try {
         response = await axios.post(
             IMAP_ADMIN_EMAIL_API,
@@ -128,6 +131,7 @@ async function generateImapKey(email) {
                     ...(await getImapAuthHeaders()),
                     'Content-Type': 'application/json'
                 },
+                ...transportConfig,
                 timeout: 30000
             }
         );
@@ -143,6 +147,7 @@ async function generateImapKey(email) {
                         ...(await getImapAuthHeaders()),
                         'Content-Type': 'application/json'
                     },
+                    ...transportConfig,
                     timeout: 30000
                 }
             );
@@ -461,6 +466,7 @@ function isOauthAddPhoneError(result) {
 }
 
 async function runActivationProcess(accessToken, cdk, runtimeAssets, runtimeJobKey = '') {
+    const systemProxy = String(await store.getAppConfigValue('system_proxy', '')).trim();
     return runActivationChild(
         path.join(__dirname, 'index.js'),
         [],
@@ -468,6 +474,7 @@ async function runActivationProcess(accessToken, cdk, runtimeAssets, runtimeJobK
             ...process.env,
             CHATGPT_TOKEN: accessToken,
             CDK_CODE: cdk,
+            SYSTEM_PROXY: systemProxy,
             SMS_API_KEY: runtimeAssets?.phone?.key || '',
             BILLING_PHONE: runtimeAssets?.phone?.phone || '',
             PROXY: runtimeAssets?.proxy || '',
@@ -704,6 +711,7 @@ async function runRegistrationProcess(onProgress, runtimeJobKey = '') {
     }
 
     const childEnv = { ...process.env };
+    childEnv.SYSTEM_PROXY = String(await store.getAppConfigValue('system_proxy', '')).trim();
 
     // 邮箱来源标记
     childEnv.EMAIL_SOURCE = emailSource;
@@ -717,6 +725,8 @@ async function runRegistrationProcess(onProgress, runtimeJobKey = '') {
     if (emailSource === 'inbox') {
         childEnv.INBOX_API_BASE = String(await store.getAppConfigValue('inbox_api_base', 'https://temp-email-api.jzqkwl.com'))
             .trim().replace(/\/+$/, '') || 'https://temp-email-api.jzqkwl.com';
+        childEnv.INBOX_PROVIDER = String(await store.getAppConfigValue('inbox_provider', 'cloudflare_temp_email')).trim() || 'cloudflare_temp_email';
+        childEnv.INBOX_TOKEN = String(await store.getAppConfigValue('inbox_token', '')).trim();
         childEnv.INBOX_EMAIL_DOMAIN = String(await store.getAppConfigValue('inbox_email_domain', ''))
             .trim().replace(/^@/, '');
         // 多域名：一行一个 / 逗号 / 分号 / 空格分隔，子进程会随机挑一个
@@ -797,6 +807,7 @@ async function runProtocolProcess(email, onProgress, runtimeJobKey = '', inboxBu
             .trim().replace(/^@/, '').toLowerCase() || 'chiyiyi.cloud';
     } catch (_) { /* 忽略，使用默认 */ }
     const protocolEnv = { ...process.env, RANDOM_EMAIL_DOMAIN: randomDomainCfg };
+    protocolEnv.SYSTEM_PROXY = String(await store.getAppConfigValue('system_proxy', '')).trim();
     // 把注册阶段的邮箱后端凭证透传给 oauth_login，让它用同一个 API 拿 OAuth 验证码
     if (inboxBundle.emailSource) {
         protocolEnv.EMAIL_SOURCE = inboxBundle.emailSource;
@@ -806,6 +817,16 @@ async function runProtocolProcess(email, onProgress, runtimeJobKey = '', inboxBu
     }
     if (inboxBundle.inboxApiBase) {
         protocolEnv.INBOX_API_BASE = inboxBundle.inboxApiBase;
+    }
+    if (inboxBundle.inboxProvider) {
+        protocolEnv.INBOX_PROVIDER = inboxBundle.inboxProvider;
+    }
+    if (inboxBundle.inboxToken) {
+        protocolEnv.INBOX_TOKEN = inboxBundle.inboxToken;
+    }
+    if (inboxBundle.inboxProxy) {
+        protocolEnv.INBOX_PROXY = inboxBundle.inboxProxy;
+        protocolEnv.PROXY = inboxBundle.inboxProxy;
     }
 
     for (let attempt = 1; attempt <= CONFIG.MAX_PROTOCOL_RETRIES; attempt += 1) {
@@ -883,7 +904,10 @@ async function startProductCreation(cdk, progressCallback, options = {}) {
             const inboxBundle = {
                 emailSource: regResult.emailSource || '',
                 inboxJwt: regResult.inboxJwt || '',
-                inboxApiBase: regResult.inboxApiBase || ''
+                inboxApiBase: regResult.inboxApiBase || '',
+                inboxProvider: regResult.inboxProvider || '',
+                inboxToken: regResult.inboxToken || '',
+                inboxProxy: regResult.inboxProxy || ''
             };
 
             let activationAttempt = 0;
@@ -943,6 +967,7 @@ async function startProductCreation(cdk, progressCallback, options = {}) {
                         ...process.env,
                         CHATGPT_TOKEN: accessToken,
                         CDK_CODE: cdk,
+                        SYSTEM_PROXY: String(await store.getAppConfigValue('system_proxy', '')).trim(),
                         SMS_API_KEY: runtimeAssets?.phone?.key || '',
                         BILLING_PHONE: runtimeAssets?.phone?.phone || '',
                         PROXY: runtimeAssets?.proxy || '',

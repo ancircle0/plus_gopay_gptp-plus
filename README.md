@@ -145,7 +145,7 @@ npx playwright install chromium     # Linux 服务器：npx playwright install -
 ### 3. 建库 & 配置
 
 ```bash
-# 建库
+# 建库（服务启动时也会自动尝试创建）
 mysql -uroot -p -e "CREATE DATABASE plus_papay CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 
 # 复制环境变量模板，按注释填
@@ -166,11 +166,11 @@ SMS_API_KEY=<sms-platform-key>
 ### 4. 启动
 
 ```bash
-# Linux / macOS
-DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=root DB_PASSWORD=xxx DB_NAME=plus_papay node server.js
+# 读取 .env 并启动
+npm start
 
 # Windows PowerShell（headful 调试）
-$env:HEADFUL='1'; node server.js
+npm run start:headful
 ```
 
 启动成功会看到：

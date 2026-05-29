@@ -1769,8 +1769,17 @@
                 <div class="panel">
                     <h2 class="panel-title">网络与并发</h2>
                     <div class="form-group" style="margin-top: 24px;">
+                        <label>系统代理（第一跳，可选）</label>
+                        <textarea id="system_proxy" rows="2" class="asset-input" style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; min-height: 72px; resize: vertical;"
+                            placeholder="仅外部网络出口使用；localhost / 127.0.0.1 / MySQL 不走这里
+socks5://127.0.0.1:10800"></textarea>
+                        <p style="font-size: 13px; color: var(--text-dim); margin-top: 10px;">
+                            不填则无第一跳；填什么协议就按什么协议使用，不自动改写。原批量代理池会作为第二跳叠加在它之后。
+                        </p>
+                    </div>
+                    <div class="form-group" style="margin-top: 24px;">
                         <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
-                            <label style="margin: 0;">代理服务器地址（PROXY URL）</label>
+                            <label style="margin: 0;">批量代理池（第二跳 PROXY URL）</label>
                             <button type="button" class="btn btn-success" style="padding:6px 12px; font-size:13px;" onclick="batchTestProxies()">
                                 <i data-lucide="zap"></i>
                                 批量测试
@@ -1781,7 +1790,7 @@
 http://user:pass@host:port
 http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                         <p style="font-size: 13px; color: var(--text-dim); margin-top: 10px;">
-                            一行一条，每次任务随机抽一条；含 <code>{session}</code> 自动替换成随机串以走 sticky session（保持同一出口 IP）。
+                            一行一条，每次任务随机抽一条；含 <code>{session}</code> 自动替换成随机串以走 sticky session（保持同一出口 IP）。若上方系统代理已配置，测试和任务会先走系统代理再走这里。
                         </p>
                         <div id="proxy_test_panel" style="display:none; margin-top: 12px; border:1px solid var(--divider); border-radius:10px; overflow:hidden;">
                             <div style="padding: 8px 12px; background: var(--surface-soft); display:flex; justify-content:space-between; align-items:center;">
@@ -1865,10 +1874,10 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                             <div class="email-source-body">
                                 <div class="email-source-title">
                                     <i data-lucide="inbox"></i>
-                                    <span>Inbox 临时邮箱（cloudflare_temp_email）</span>
+                                    <span>Inbox 临时邮箱</span>
                                 </div>
                                 <div class="email-source-desc">
-                                    每次注册自动调用 <code>POST /api/new_address</code> 创建一个临时邮箱，OTP 通过 <code>GET /api/mails</code> 拉取。无需邮箱池，开箱即用。
+                                    支持 cloudflare_temp_email 与 idinging/freemail。每次注册自动创建临时邮箱并轮询 OTP。无需邮箱池，开箱即用。
                                 </div>
                             </div>
                         </label>
@@ -1889,10 +1898,40 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
 
                     <div id="inbox_email_options" style="margin-top: 18px;" data-disabled="1">
                         <div class="form-group">
+                            <label>Inbox Provider</label>
+                            <div class="email-source-options" style="margin-top: 10px;">
+                                <label class="email-source-card">
+                                    <input type="radio" name="inbox_provider" id="inbox_provider_cloudflare" value="cloudflare_temp_email">
+                                    <div class="email-source-body">
+                                        <div class="email-source-title">
+                                            <i data-lucide="cloud"></i>
+                                            <span>cloudflare_temp_email</span>
+                                        </div>
+                                    </div>
+                                </label>
+                                <label class="email-source-card">
+                                    <input type="radio" name="inbox_provider" id="inbox_provider_freemail" value="freemail">
+                                    <div class="email-source-body">
+                                        <div class="email-source-title">
+                                            <i data-lucide="mail"></i>
+                                            <span>idinging/freemail</span>
+                                        </div>
+                                    </div>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="form-group">
                             <label>Inbox API 地址</label>
                             <input type="text" id="inbox_api_base" class="asset-input" placeholder="https://temp-email-api.jzqkwl.com">
                             <p style="font-size: 13px; color: var(--text-dim); margin-top: 8px;">
-                                cloudflare_temp_email 的 API 后端，结尾不要带 <code>/</code>。
+                                API 后端地址，结尾不要带 <code>/</code>。freemail 填你的 freemail 部署地址。
+                            </p>
+                        </div>
+                        <div class="form-group" style="margin-top: 14px;">
+                            <label>freemail JWT_TOKEN（可选）</label>
+                            <input type="password" id="inbox_token" class="asset-input" placeholder="仅 freemail 私有部署需要">
+                            <p style="font-size: 13px; color: var(--text-dim); margin-top: 8px;">
+                                对应 idinging/freemail 的 <code>JWT_TOKEN</code>，请求时会作为 Bearer Token 发送。公开实例或未开启鉴权可留空。
                             </p>
                         </div>
                         <div class="form-group" style="margin-top: 14px;">
@@ -2514,6 +2553,7 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
         /** 后台定时 loadData（含任务管理列表）；为便于阅读可暂停 */
         let adminDataRefreshPaused = false;
         let adminDataRefreshTimer = null;
+        let configEditing = false;
 
         /** 当前成品批量生产 WebSocket 对应的 jobKey，用于「停止生产」 */
         window.__adminProductGenJobKey = '';
@@ -3413,6 +3453,10 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                 }
 
                 if (isInitial) {
+                    const systemProxyEl = document.getElementById('system_proxy');
+                    if (systemProxyEl) {
+                        systemProxyEl.value = data.config.system_proxy || '';
+                    }
                     document.getElementById('proxy').value = data.config.proxy || '';
                     document.getElementById('max_concurrent_activations').value = data.config.max_concurrent_activations || 1;
                     document.getElementById('max_background_concurrent').value = data.config.max_background_concurrent || 1;
@@ -3428,45 +3472,60 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                 lastMaintenanceModeValue = Boolean(data.config.maintenance_mode);
                 updateMaintenanceModeUI(data.config, window.__adminRuntime);
 
-                const src = ['random', 'pool', 'inbox'].includes(String(data.config.email_source))
-                    ? String(data.config.email_source)
-                    : (data.config.pool_email_enabled ? 'pool' : 'random');
-                const radioRandom = document.getElementById('email_source_random');
-                const radioPool = document.getElementById('email_source_pool');
-                const radioInbox = document.getElementById('email_source_inbox');
-                if (radioRandom && radioPool && radioInbox) {
-                    radioRandom.checked = src === 'random';
-                    radioPool.checked = src === 'pool';
-                    radioInbox.checked = src === 'inbox';
-                    syncEmailSourceUI();
-                }
-                const poolEmailHostEl = document.getElementById('pool_email_imap_host');
-                if (poolEmailHostEl) {
-                    poolEmailHostEl.value = data.config.pool_email_imap_host || 'outlook.office365.com';
-                }
-                const poolEmailJunkEl = document.getElementById('pool_email_include_junk');
-                if (poolEmailJunkEl) {
-                    poolEmailJunkEl.checked = data.config.pool_email_include_junk !== false;
-                }
-                const randomDomainEl = document.getElementById('random_email_domain');
-                if (randomDomainEl) {
-                    randomDomainEl.value = data.config.random_email_domain || 'chiyiyi.cloud';
-                }
-                const inboxBaseEl = document.getElementById('inbox_api_base');
-                if (inboxBaseEl) {
-                    inboxBaseEl.value = data.config.inbox_api_base || 'https://temp-email-api.jzqkwl.com';
-                }
-                const inboxDomainEl = document.getElementById('inbox_email_domain');
-                if (inboxDomainEl) {
-                    inboxDomainEl.value = data.config.inbox_email_domain || '';
-                }
-                const inboxDomainsEl = document.getElementById('inbox_email_domains');
-                if (inboxDomainsEl) {
-                    const list = data.config.inbox_email_domains;
-                    if (Array.isArray(list)) {
-                        inboxDomainsEl.value = list.join('\n');
-                    } else {
-                        inboxDomainsEl.value = String(list || '').replace(/[,;]/g, '\n');
+                if (!configEditing || isInitial) {
+                    const src = ['random', 'pool', 'inbox'].includes(String(data.config.email_source))
+                        ? String(data.config.email_source)
+                        : (data.config.pool_email_enabled ? 'pool' : 'random');
+                    const radioRandom = document.getElementById('email_source_random');
+                    const radioPool = document.getElementById('email_source_pool');
+                    const radioInbox = document.getElementById('email_source_inbox');
+                    if (radioRandom && radioPool && radioInbox) {
+                        radioRandom.checked = src === 'random';
+                        radioPool.checked = src === 'pool';
+                        radioInbox.checked = src === 'inbox';
+                        syncEmailSourceUI({ markEditing: false });
+                    }
+                    const poolEmailHostEl = document.getElementById('pool_email_imap_host');
+                    if (poolEmailHostEl) {
+                        poolEmailHostEl.value = data.config.pool_email_imap_host || 'outlook.office365.com';
+                    }
+                    const poolEmailJunkEl = document.getElementById('pool_email_include_junk');
+                    if (poolEmailJunkEl) {
+                        poolEmailJunkEl.checked = data.config.pool_email_include_junk !== false;
+                    }
+                    const randomDomainEl = document.getElementById('random_email_domain');
+                    if (randomDomainEl) {
+                        randomDomainEl.value = data.config.random_email_domain || 'chiyiyi.cloud';
+                    }
+                    const inboxBaseEl = document.getElementById('inbox_api_base');
+                    if (inboxBaseEl) {
+                        inboxBaseEl.value = data.config.inbox_api_base || 'https://temp-email-api.jzqkwl.com';
+                    }
+                    const inboxProvider = String(data.config.inbox_provider || '') === 'freemail'
+                        ? 'freemail'
+                        : 'cloudflare_temp_email';
+                    const inboxProviderCloudflareEl = document.getElementById('inbox_provider_cloudflare');
+                    const inboxProviderFreemailEl = document.getElementById('inbox_provider_freemail');
+                    if (inboxProviderCloudflareEl && inboxProviderFreemailEl) {
+                        inboxProviderCloudflareEl.checked = inboxProvider === 'cloudflare_temp_email';
+                        inboxProviderFreemailEl.checked = inboxProvider === 'freemail';
+                    }
+                    const inboxTokenEl = document.getElementById('inbox_token');
+                    if (inboxTokenEl) {
+                        inboxTokenEl.value = data.config.inbox_token || '';
+                    }
+                    const inboxDomainEl = document.getElementById('inbox_email_domain');
+                    if (inboxDomainEl) {
+                        inboxDomainEl.value = data.config.inbox_email_domain || '';
+                    }
+                    const inboxDomainsEl = document.getElementById('inbox_email_domains');
+                    if (inboxDomainsEl) {
+                        const list = data.config.inbox_email_domains;
+                        if (Array.isArray(list)) {
+                            inboxDomainsEl.value = list.join('\n');
+                        } else {
+                            inboxDomainsEl.value = String(list || '').replace(/[,;]/g, '\n');
+                        }
                     }
                 }
 
@@ -3545,7 +3604,10 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                 const res = await authFetch('/api/admin/proxy/test', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ proxies: lines })
+                    body: JSON.stringify({
+                        systemProxy: String(document.getElementById('system_proxy')?.value || '').trim(),
+                        proxies: lines
+                    })
                 });
                 const raw = await res.text();
                 if (!raw || !raw.trim()) {
@@ -3588,7 +3650,15 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
             return 'random';
         }
 
-        function syncEmailSourceUI() {
+        function getCurrentInboxProvider() {
+            const checked = document.querySelector('input[name="inbox_provider"]:checked');
+            return checked?.value === 'freemail' ? 'freemail' : 'cloudflare_temp_email';
+        }
+
+        function syncEmailSourceUI(options = {}) {
+            if (options.markEditing !== false) {
+                configEditing = true;
+            }
             const src = getCurrentEmailSource();
             document.querySelectorAll('.email-source-card').forEach((card) => {
                 const input = card.querySelector('input[type="radio"]');
@@ -3617,6 +3687,7 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
         function buildConfigPayload(overrides = {}) {
             const src = getCurrentEmailSource();
             return {
+                system_proxy: String(document.getElementById('system_proxy')?.value || '').trim(),
                 proxy: document.getElementById('proxy').value,
                 max_concurrent_activations: Math.max(1, parseInt(document.getElementById('max_concurrent_activations').value, 10) || 1),
                 max_background_concurrent: Math.max(1, parseInt(document.getElementById('max_background_concurrent').value, 10) || 1),
@@ -3629,6 +3700,8 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                 pool_email_include_junk: Boolean(document.getElementById('pool_email_include_junk')?.checked),
                 random_email_domain: normalizeRandomDomain(document.getElementById('random_email_domain')?.value),
                 inbox_api_base: String(document.getElementById('inbox_api_base')?.value || 'https://temp-email-api.jzqkwl.com').trim().replace(/\/+$/, '') || 'https://temp-email-api.jzqkwl.com',
+                inbox_provider: getCurrentInboxProvider(),
+                inbox_token: String(document.getElementById('inbox_token')?.value || '').trim(),
                 inbox_email_domain: String(document.getElementById('inbox_email_domain')?.value || '').trim().replace(/^@/, ''),
                 inbox_email_domains: String(document.getElementById('inbox_email_domains')?.value || '')
                     .split(/[\n,;\s]+/)
@@ -3666,6 +3739,7 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                     throw new Error(data.message || '维护模式保存失败');
                 }
                 lastMaintenanceModeValue = nextValue;
+                configEditing = false;
                 showMessage(data.message, 'success');
                 await loadData(true);
             } catch (error) {
@@ -4160,6 +4234,7 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                 if (!res.ok || !data.success) {
                     throw new Error(data.message || '保存失败');
                 }
+                configEditing = false;
                 showMessage(data.message, 'success');
                 await loadData(true);
             } catch (error) {
@@ -4626,6 +4701,11 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
 
         document.querySelectorAll('input[name="email_source"]').forEach((el) => {
             el.addEventListener('change', () => syncEmailSourceUI());
+        });
+
+        document.querySelectorAll('#config input, #config textarea, #config select').forEach((el) => {
+            el.addEventListener('input', () => { configEditing = true; });
+            el.addEventListener('change', () => { configEditing = true; });
         });
 
         bootAdmin();

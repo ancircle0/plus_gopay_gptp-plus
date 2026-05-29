@@ -6,6 +6,7 @@ const path = require('path');
 const { getImapAuthHeaders } = require('./imap-auth');
 const { fetchLatestOpenAiOtpOnce } = require('./pool-email-imap');
 const inboxEmail = require('./inbox-email');
+const { buildPlaywrightProxy, buildAxiosTransportConfig, prepareProxy, getSystemProxy } = require('./proxy-utils');
 
 // 使用 stealth 插件
 chromium.use(stealth);
@@ -109,6 +110,9 @@ async function getLatestCode(email, maxRetries = 24, excludeCode = '', options =
     const normalizedEmail = normalizeCloudEmail(email);
     console.log(`📨 [IMAP] 正在为 ${normalizedEmail} 获取验证码...`);
     const url = 'https://imap.chiyiyi.cloud/api/admin/all-messages?limit=15';
+    const proxyTransportConfig = buildAxiosTransportConfig(
+        process.env.REGISTRATION_EXTERNAL_PROXY || process.env.SYSTEM_PROXY || ''
+    );
     const onNoNewCodeFor30Seconds = typeof options.onNoNewCodeFor30Seconds === 'function'
         ? options.onNoNewCodeFor30Seconds
         : null;
@@ -133,7 +137,8 @@ async function getLatestCode(email, maxRetries = 24, excludeCode = '', options =
         try {
             let headers = await getImapAuthHeaders(false);
             const response = await axios.get(url, {
-                headers
+                headers,
+                ...proxyTransportConfig
             });
             const messages = response.data.messages;
             if (Array.isArray(messages) && messages.length > 0) {
@@ -164,7 +169,7 @@ async function getLatestCode(email, maxRetries = 24, excludeCode = '', options =
                 console.warn('📨 [IMAP] 鉴权失败 (401)，正在强制刷新 Token 后重试...');
                 try {
                     const headers = await getImapAuthHeaders(true);
-                    const retryResponse = await axios.get(url, { headers });
+                    const retryResponse = await axios.get(url, { headers, ...proxyTransportConfig });
                     const messages = retryResponse.data.messages;
                     if (Array.isArray(messages) && messages.length > 0) {
                         const targetMessages = messages
@@ -307,25 +312,6 @@ function generateRandomString(length) {
         result += chars.charAt(Math.floor(Math.random() * chars.length));
     }
     return result;
-}
-
-function buildPlaywrightProxy(proxyValue) {
-    if (!proxyValue) return null;
-    try {
-        const parsed = new URL(proxyValue);
-        const server = `${parsed.protocol}//${parsed.hostname}${parsed.port ? `:${parsed.port}` : ''}`;
-        const proxy = { server };
-        if (parsed.username) {
-            proxy.username = decodeURIComponent(parsed.username);
-        }
-        if (parsed.password) {
-            proxy.password = decodeURIComponent(parsed.password);
-        }
-        return proxy;
-    } catch (e) {
-        console.warn(`⚠️  [系统] 代理 URL 解析失败，将按原始值使用: ${e.message}`);
-        return { server: proxyValue };
-    }
 }
 
 const sleep = (ms) => new Promise(res => setTimeout(res, ms));
@@ -1036,6 +1022,8 @@ async function runRegistrationFlow() {
 
     const emailSource = String(process.env.EMAIL_SOURCE || 'random').toLowerCase();
     const inboxApiBase = String(process.env.INBOX_API_BASE || 'https://temp-email-api.jzqkwl.com').trim().replace(/\/+$/, '');
+    const inboxProvider = inboxEmail.normalizeProvider(process.env.INBOX_PROVIDER || 'cloudflare_temp_email');
+    const inboxToken = String(process.env.INBOX_TOKEN || '').trim();
     const inboxEmailDomain = String(process.env.INBOX_EMAIL_DOMAIN || '').trim().replace(/^@/, '');
     // 多域名候选：每次随机挑一个，避免单一域名被风控/限频
     const inboxEmailDomainsList = String(process.env.INBOX_EMAIL_DOMAINS || '')
@@ -1051,11 +1039,22 @@ async function runRegistrationFlow() {
 
     // 从后端数据库动态获取代理资产（仅取代理，不锁定手机/卡资产）
     let proxyValue = '';
+    let taskProxyValue = '';
+    let systemProxy = '';
     try {
-        proxyValue = await store.getActiveProxy();
+        taskProxyValue = await store.getActiveProxy();
+        proxyValue = taskProxyValue;
+        systemProxy = await getSystemProxy(store);
     } catch (e) {
         console.warn(`⚠️  [系统] 无法从后端获取代理配置: ${e.message}`);
     }
+    const proxySetup = await prepareProxy({
+        systemProxy,
+        taskProxy: taskProxyValue,
+        label: '注册代理'
+    });
+    proxyValue = proxySetup.proxyUrl || '';
+    process.env.REGISTRATION_EXTERNAL_PROXY = proxyValue;
 
     const hasOauth = Boolean(poolEmailId && rawPoolEmail && poolClientId && poolRefreshToken);
     const hasPlainPwd = Boolean(poolEmailId && rawPoolEmail && poolImapPass);
@@ -1081,8 +1080,11 @@ async function runRegistrationFlow() {
         for (const tryDomain of tryOrder) {
             try {
                 const newInbox = await inboxEmail.createAddress({
+                    provider: inboxProvider,
                     baseUrl: inboxApiBase,
-                    domain: tryDomain || undefined
+                    token: inboxToken,
+                    domain: tryDomain || undefined,
+                    proxyUrl: proxyValue
                 });
                 email = newInbox.address;
                 inboxJwt = newInbox.jwt;
@@ -1138,10 +1140,9 @@ async function runRegistrationFlow() {
             launchOptions.channel = CHROMIUM_CHANNEL; // 'chrome' / 'msedge'
         }
 
-        const proxyConfig = buildPlaywrightProxy(proxyValue);
+        const proxyConfig = proxySetup.playwrightProxy || buildPlaywrightProxy(proxyValue);
         if (proxyConfig) {
             launchOptions.proxy = proxyConfig;
-            const _proxyHost = (() => { try { return new URL(proxyValue).host; } catch (_) { return '已配置'; } })();
             console.log(`🌐 [系统] 代理已配置`);
         } else {
             console.log("🌐 [系统] 未配置代理，使用本机出口直连。");
@@ -1706,12 +1707,15 @@ async function runRegistrationFlow() {
                 maxRetries: pollOpts.maxRetries,
                 excludeCode,
                 onNoNewCodeFor30Seconds: pollOpts.onNoNewCodeFor30Seconds,
-                onBeforePoll: pollOpts.onBeforePoll
+                onBeforePoll: pollOpts.onBeforePoll,
+                proxyUrl: proxyValue
             });
         } else if (useInbox) {
             fetchCodeFn = async (excludeCode, pollOpts) => inboxEmail.fetchLatestOpenAiOtp({
+                provider: inboxProvider,
                 baseUrl: inboxApiBase,
                 jwt: inboxJwt,
+                token: inboxToken,
                 address: email,
                 maxRetries: pollOpts.maxRetries,
                 excludeCode,
@@ -1890,13 +1894,17 @@ async function runRegistrationFlow() {
         }
 
         await browser.close();
+        await proxySetup.close().catch(() => { });
         // 把邮箱来源/JWT/API base 一起回传，让 oauth_login 用同一个邮箱后端拿验证码
         return {
             email,
             accessToken: sessionData.accessToken,
             emailSource,
             inboxJwt: inboxJwt || '',
-            inboxApiBase: useInbox ? inboxApiBase : ''
+            inboxApiBase: useInbox ? inboxApiBase : '',
+            inboxProvider: useInbox ? inboxProvider : '',
+            inboxToken: useInbox ? inboxToken : '',
+            inboxProxy: useInbox ? taskProxyValue : ''
         };
     } catch (e) {
         const isUserExists = String(e?.message || '').includes(USER_ALREADY_EXISTS_ERROR)
@@ -1923,6 +1931,7 @@ async function runRegistrationFlow() {
         }
 
         if (browser) await browser.close();
+        await proxySetup.close().catch(() => { });
         throw e;
     }
 }

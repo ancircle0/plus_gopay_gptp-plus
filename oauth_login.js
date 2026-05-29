@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const { getImapAuthHeaders } = require('./imap-auth');
 const inboxEmail = require('./inbox-email');
+const proxyUtils = require('./proxy-utils');
 
 // 使用 stealth 插件
 chromium.use(stealth);
@@ -55,24 +56,7 @@ function parseProxyUrl(proxyValue) {
 }
 
 function buildPlaywrightProxy(proxyValue) {
-    const parsed = parseProxyUrl(proxyValue);
-    if (!parsed) {
-        return null;
-    }
-
-    const proxy = {
-        server: parsed.server
-    };
-
-    if (parsed.username) {
-        proxy.username = parsed.username;
-    }
-
-    if (parsed.password) {
-        proxy.password = parsed.password;
-    }
-
-    return proxy;
+    return proxyUtils.buildPlaywrightProxy(proxyValue);
 }
 
 function buildAxiosProxyConfig(proxyValue) {
@@ -98,32 +82,7 @@ function buildAxiosProxyConfig(proxyValue) {
 }
 
 async function buildAxiosTransportConfig(proxyValue) {
-    if (!proxyValue) {
-        return {};
-    }
-
-    const parsed = parseProxyUrl(proxyValue);
-    if (!parsed) {
-        return {};
-    }
-
-    if (parsed.protocol.startsWith('socks')) {
-        const { SocksProxyAgent } = await import('socks-proxy-agent');
-        const agent = new SocksProxyAgent(proxyValue);
-        return {
-            httpAgent: agent,
-            httpsAgent: agent,
-            proxy: false
-        };
-    }
-
-    const { HttpsProxyAgent } = await import('https-proxy-agent');
-    const agent = new HttpsProxyAgent(proxyValue);
-    return {
-        httpAgent: agent,
-        httpsAgent: agent,
-        proxy: false
-    };
+    return proxyUtils.buildAxiosTransportConfig(proxyValue);
 }
 
 /**
@@ -185,20 +144,29 @@ async function getLatestCode(email, maxRetries = 30, excludeCode = '', options =
     const emailSource = String(process.env.EMAIL_SOURCE || '').toLowerCase();
     const inboxJwt = String(process.env.INBOX_JWT || '');
     const inboxApiBase = String(process.env.INBOX_API_BASE || '').trim().replace(/\/+$/, '');
-    if (emailSource === 'inbox' && inboxJwt && inboxApiBase) {
+    const inboxProvider = inboxEmail.normalizeProvider(process.env.INBOX_PROVIDER || 'cloudflare_temp_email');
+    const inboxToken = String(process.env.INBOX_TOKEN || '').trim();
+    const inboxProxy = String(process.env.INBOX_PROXY || '').trim();
+    if (emailSource === 'inbox' && inboxApiBase && (inboxProvider === 'freemail' || inboxJwt)) {
         return inboxEmail.fetchLatestOpenAiOtp({
+            provider: inboxProvider,
             baseUrl: inboxApiBase,
             jwt: inboxJwt,
+            token: inboxToken,
             address: normalizedEmail,
             maxRetries,
             excludeCode,
             onNoNewCodeFor30Seconds: options.onNoNewCodeFor30Seconds || null,
-            onBeforePoll: options.onBeforePoll || null
+            onBeforePoll: options.onBeforePoll || null,
+            proxyUrl: inboxProxy
         });
     }
 
     console.log(`📨 [IMAP] 正在为 ${normalizedEmail} 获取验证码...`);
     const url = 'https://imap.chiyiyi.cloud/api/admin/all-messages?limit=15';
+    const proxyTransportConfig = await buildAxiosTransportConfig(
+        process.env.INBOX_PROXY || process.env.SYSTEM_PROXY || ''
+    );
     const onNoNewCodeFor30Seconds = typeof options.onNoNewCodeFor30Seconds === 'function'
         ? options.onNoNewCodeFor30Seconds
         : null;
@@ -223,7 +191,8 @@ async function getLatestCode(email, maxRetries = 30, excludeCode = '', options =
         try {
             let headers = await getImapAuthHeaders(false);
             const response = await axios.get(url, {
-                headers
+                headers,
+                ...proxyTransportConfig
             });
             const messages = response.data.messages;
             if (Array.isArray(messages) && messages.length > 0) {
@@ -254,7 +223,7 @@ async function getLatestCode(email, maxRetries = 30, excludeCode = '', options =
                 console.warn('📨 [IMAP] 鉴权失败 (401)，正在强制刷新 Token 后重试...');
                 try {
                     const headers = await getImapAuthHeaders(true);
-                    const retryResponse = await axios.get(url, { headers });
+                    const retryResponse = await axios.get(url, { headers, ...proxyTransportConfig });
                     const messages = retryResponse.data.messages;
                     if (Array.isArray(messages) && messages.length > 0) {
                         const targetMessages = messages
@@ -830,10 +799,18 @@ async function runFullProtocolFlow(email) {
     // 阶段三代理检查（仅取代理，不锁定手机/卡资产）；失败则重新拉取配置并多轮重试
     const maxProxyRounds = 5;
     let proxyValue = '';
+    let proxySetup = null;
     let proxyOk = false;
     for (let round = 1; round <= maxProxyRounds; round += 1) {
         try {
-            proxyValue = await store.getActiveProxy();
+            const taskProxy = String(process.env.PROXY || '') || await store.getActiveProxy();
+            const systemProxy = String(process.env.SYSTEM_PROXY || '') || await proxyUtils.getSystemProxy(store);
+            proxySetup = await proxyUtils.prepareProxy({
+                systemProxy,
+                taskProxy,
+                label: '协议代理'
+            });
+            proxyValue = proxySetup.proxyUrl || '';
         } catch (e) {
             console.warn(`[!] [系统] 无法从后端获取代理配置: ${e.message}`);
         }
@@ -845,10 +822,18 @@ async function runFullProtocolFlow(email) {
 
         console.warn(`⚠️ [代理检查] 第 ${round}/${maxProxyRounds} 轮未通过，2s 后重新拉取代理并重试...`);
         if (round >= maxProxyRounds) {
+            if (proxySetup) {
+                await proxySetup.close().catch(() => { });
+            }
             throw new Error('代理不可用');
+        }
+        if (proxySetup) {
+            await proxySetup.close().catch(() => { });
+            proxySetup = null;
         }
         await sleep(2000);
     }
+    process.env.INBOX_PROXY = proxyValue;
 
     const { verifier, challenge } = generatePKCE();
     const state = crypto.randomBytes(16).toString('hex');
@@ -861,10 +846,9 @@ async function runFullProtocolFlow(email) {
         const launchOptions = {
             headless: true
         };
-        const playwrightProxy = buildPlaywrightProxy(proxyValue);
+        const playwrightProxy = proxySetup?.playwrightProxy || buildPlaywrightProxy(proxyValue);
         if (playwrightProxy) {
             launchOptions.proxy = playwrightProxy;
-            const _proxyHost = (() => { try { return new URL(proxyValue).host; } catch (_) { return '已配置'; } })();
             console.log(`🌐 [系统] 代理已配置`);
         }
 
@@ -925,6 +909,7 @@ async function runFullProtocolFlow(email) {
         throw e;
     } finally {
         if (browser) await browser.close();
+        if (proxySetup) await proxySetup.close().catch(() => { });
     }
 }
 
